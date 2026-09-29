@@ -1,8 +1,6 @@
-# schedulesorter-heartbeat
+# website-heartbeat
 
-External uptime monitor for [schedulesorter.com](https://schedulesorter.com), run on
-GitHub Actions. It is kept in its own public repo because Actions minutes are free
-for public repos, and the private app repo's 2,000-minute allowance kept running out.
+External uptime monitor for a website
 
 | Workflow | Cadence | Behaviour |
 |---|---|---|
