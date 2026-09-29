@@ -1,0 +1,73 @@
+# ScheduleSorter heartbeat — external uptime check (Layer 1 "Watchman").
+#
+# Runs on GitHub's infrastructure (NOT the production server) so it survives
+# the box going down. Probes the public site every 10 min and pings Telegram
+# ONLY when something is wrong. The daily "all green" summary lives in
+# heartbeat-digest.yml.
+#
+# Why this lives in its own PUBLIC repo: standard GitHub-hosted runners are
+# free and unmetered for public repos. In the private app repo every run was
+# billed and rounded up to a whole minute, so this probe alone ate ~1,460 of
+# the 2,000 free minutes a month at a 30-min interval (~4,400 at 10 min) and
+# CI ran the allowance dry — which then stopped this monitor too.
+#
+# Everything in this repo is public, including run logs. Nothing here may
+# reveal more than the public URLs: secrets stay in repo secrets, and curl
+# output that could echo them is discarded.
+#
+# GitHub delays `schedule` events under load and sometimes drops them, so the
+# real interval is looser than the cron says.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   TG_TOKEN  - Telegram bot token from @BotFather
+#   TG_CHAT   - your personal chat id (from the bot's getUpdates)
+name: heartbeat
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes
+  workflow_dispatch: {}        # also runnable by hand from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe public endpoints
+        id: probe
+        run: |
+          fails=""
+          probe () {   # $1 = url, $2 = expected HTTP code
+            code=$(curl -sk -o /tmp/body -w "%{http_code}" --max-time 20 "$1")
+            if [ "$code" != "$2" ]; then
+              fails="${fails}
+          - $1 -> HTTP $code (expected $2)"
+            fi
+          }
+          probe https://schedulesorter.com           200
+          probe https://schedulesorter.com/api/health 200
+          if ! grep -q '"db": *"ok"' /tmp/body; then
+            fails="${fails}
+          - /api/health did not report db: ok"
+          fi
+          {
+            echo "fails<<EOF"
+            echo "$fails"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert on failure
+        if: steps.probe.outputs.fails != ''
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          FAILS: ${{ steps.probe.outputs.fails }}
+        run: |
+          # -o /dev/null: Telegram's response echoes the chat and bot details,
+          # and run logs in this repo are public.
+          curl -s -o /dev/null "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" \
+            --data-urlencode "text=🔴 ScheduleSorter health check FAILED:${FAILS}"

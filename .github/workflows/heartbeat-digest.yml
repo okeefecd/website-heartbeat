@@ -1,0 +1,91 @@
+# ScheduleSorter daily digest — the reassuring "still alive" heartbeat.
+#
+# Once a day it runs the same probes plus a TLS cert-expiry check and ALWAYS
+# sends a one-line summary to Telegram (green or red), so silence never has to
+# mean "is the monitor itself broken?". Pair with heartbeat.yml, which is the
+# fast (10-min) alert path.
+#
+# It also keeps both workflows alive: GitHub automatically disables scheduled
+# workflows in a public repo after 60 days with no repository activity, and a
+# repo that only runs a monitor never has any. Re-enabling them through the API
+# every day resets that clock without making commits.
+#
+# Uses the same TG_TOKEN / TG_CHAT secrets as heartbeat.yml.
+name: heartbeat-digest
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 08:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  actions: write   # for the keep-alive step
+  contents: read
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe + cert expiry
+        id: probe
+        run: |
+          status="🟢 all green"
+          detail=""
+          check () {   # $1 = url, $2 = expected HTTP code
+            code=$(curl -sk -o /tmp/body -w "%{http_code}" --max-time 20 "$1")
+            line="$1 -> HTTP $code"
+            if [ "$code" != "$2" ]; then status="🔴 problems"; line="$line (expected $2)"; fi
+            detail="${detail}
+          - ${line}"
+          }
+          check https://schedulesorter.com           200
+          check https://schedulesorter.com/api/health 200
+          if grep -q '"db": *"ok"' /tmp/body; then
+            detail="${detail}
+          - db: ok"
+          else
+            status="🔴 problems"
+            detail="${detail}
+          - db: NOT ok"
+          fi
+          # TLS certificate days remaining
+          exp=$(echo | openssl s_client -servername schedulesorter.com -connect schedulesorter.com:443 2>/dev/null \
+                | openssl x509 -noout -enddate | cut -d= -f2)
+          if [ -n "$exp" ]; then
+            days=$(( ( $(date -d "$exp" +%s) - $(date +%s) ) / 86400 ))
+            detail="${detail}
+          - TLS cert: ${days} days left"
+            if [ "$days" -lt 10 ]; then status="🔴 problems"; fi
+          else
+            status="🔴 problems"
+            detail="${detail}
+          - TLS cert: could not read"
+          fi
+          {
+            echo "status=$status"
+            echo "detail<<EOF"
+            echo "$detail"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send digest
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          STATUS: ${{ steps.probe.outputs.status }}
+          DETAIL: ${{ steps.probe.outputs.detail }}
+        run: |
+          # -o /dev/null: run logs in this repo are public.
+          curl -s -o /dev/null "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT}" \
+            --data-urlencode "text=ScheduleSorter daily check — ${STATUS}${DETAIL}"
+
+      - name: Keep scheduled workflows enabled
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for wf in heartbeat.yml heartbeat-digest.yml; do
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/enable" --silent
+          done
